@@ -4,6 +4,7 @@
 import os
 import re
 import time
+import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
 from seleniumbase import Driver
@@ -15,8 +16,8 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")
 
 # HIDENCLOUD secret 格式:
-#   email-----password            （仅账号密码，走 Turnstile 登录）
-#   email-----password-----cookie （优先用 cookie 跳过 Turnstile，失败再回退密码）
+#   email-----password                        （仅账号密码）
+#   email-----password-----remember_cookie    （Cookie 优先）
 parts = HIDENCLOUD.split("-----")
 if len(parts) >= 2:
     HIDEN_EMAIL  = parts[0].strip()
@@ -178,23 +179,99 @@ def create_driver():
     return driver
 
 
+# ====================== Cookie 管理 ======================
+def get_latest_cookies(driver):
+    """
+    从当前浏览器提取最新的 remember me cookie 和 session cookie。
+    返回 (remember_value, session_value)，未找到则返回空字符串。
+    """
+    remember_value = ""
+    session_value  = ""
+    try:
+        cookies = driver.get_cookies()
+        for c in cookies:
+            if c.get("name") == COOKIE_NAME:
+                remember_value = c["value"]
+            if c.get("name") == "laravel_session":
+                session_value = c["value"]
+    except Exception as e:
+        print(f"[WARN] 提取 cookie 失败: {e}")
+    return remember_value, session_value
+
+
+def refresh_cookie_to_secret(driver):
+    """
+    续期完成后，将浏览器中最新的 remember me cookie
+    回写到 GitHub Secret（HIDENCLOUD），保持 cookie 长期有效。
+    需要环境变量 GH_TOKEN 和 GITHUB_REPOSITORY。
+    """
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    gh_token = os.getenv("GH_TOKEN", "")
+    if not repo or not gh_token:
+        print("[WARN] 未配置 GH_TOKEN 或 GITHUB_REPOSITORY，跳过 cookie 刷新")
+        return
+
+    remember_value, _ = get_latest_cookies(driver)
+    if not remember_value:
+        print("[WARN] 浏览器中未找到 remember me cookie，跳过刷新")
+        return
+
+    if remember_value == HIDEN_COOKIE:
+        print("[INFO] Cookie 未变化，无需刷新")
+        return
+
+    new_secret = f"{HIDEN_EMAIL}-----{HIDEN_PWD}-----{remember_value}"
+    try:
+        result = subprocess.run(
+            ["gh", "secret", "set", "HIDENCLOUD",
+             "--body", new_secret,
+             "--repo", repo],
+            capture_output=True, text=True,
+            env={**os.environ, "GH_TOKEN": gh_token}
+        )
+        if result.returncode == 0:
+            print("[INFO] 🔄 Cookie 已自动刷新到 GitHub Secret")
+        else:
+            print(f"[WARN] Cookie 刷新失败: {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("[WARN] gh CLI 未找到，跳过 cookie 刷新")
+    except Exception as e:
+        print(f"[WARN] Cookie 刷新异常: {e}")
+
+
 # ====================== 登录方式 ======================
+def inject_cookies(driver, remember_value, session_value=""):
+    """
+    向浏览器注入 remember me cookie，以及可选的 session cookie。
+    注入前必须已在同域页面。
+    """
+    if remember_value:
+        driver.execute_script(
+            f"document.cookie = '{COOKIE_NAME}={remember_value}; "
+            f"path=/; domain=dash.hidencloud.com; secure; SameSite=Lax';"
+        )
+        print("[INFO] 🍪 remember me cookie 已注入")
+
+    if session_value:
+        driver.execute_script(
+            f"document.cookie = 'laravel_session={session_value}; "
+            f"path=/; domain=dash.hidencloud.com; secure; SameSite=Lax';"
+        )
+        print("[INFO] 🍪 session cookie 已注入")
+
+
 def inject_cookie_and_verify(driver):
     """
-    注入 remember me cookie 后访问 dashboard 验证是否生效。
+    注入 cookie 后访问 dashboard 验证是否生效。
     成功返回 True，失败返回 False。
     """
     print("[INFO] 🍪 尝试 Cookie 登录...")
 
-    # 必须先访问同域页面才能写 cookie
+    # 先访问同域页面才能写 cookie
     driver.get(f"{BASE_URL}/auth/login")
     time.sleep(2)
 
-    driver.execute_script(
-        f"document.cookie = '{COOKIE_NAME}={HIDEN_COOKIE}; "
-        f"path=/; domain=dash.hidencloud.com; secure; SameSite=Lax';"
-    )
-    print("[INFO] 🍪 Cookie 已注入")
+    inject_cookies(driver, HIDEN_COOKIE)
 
     driver.get(f"{BASE_URL}/dashboard")
     time.sleep(3)
@@ -211,6 +288,7 @@ def inject_cookie_and_verify(driver):
 def do_login_with_credentials(driver):
     """
     账号密码 + Turnstile 登录，Turnstile 失败最多重试 3 次。
+    登录成功后同步注入最新 cookie，提升后续会话稳定性。
     """
     TURNSTILE_RETRY = 3
     for attempt in range(1, TURNSTILE_RETRY + 1):
@@ -274,7 +352,7 @@ def ensure_logged_in(driver):
     """
     登录总入口（优先级）：
       1. 已有有效 Session → 直接跳过
-      2. 配置了 Cookie   → 注入 Cookie
+      2. 配置了 Cookie   → 注入 Cookie 验证
       3. Cookie 失效     → 回退账号密码
       4. 未配置 Cookie   → 直接账号密码
     """
@@ -424,8 +502,11 @@ def do_renew_once(driver):
     # 打印标准格式（workflow grep 兜底）
     print(f"到期时间(标准): {due_date_after_std or due_date_after_raw}")
 
-    # ★ 写入文件供 workflow 读取
+    # 写入文件供 workflow 读取
     save_due_date(due_date_after_std)
+
+    # ★ 自动刷新 cookie 到 GitHub Secret，保持长期有效
+    refresh_cookie_to_secret(driver)
 
     # ---------- 6. 判断结果 ----------
     if restricted:
