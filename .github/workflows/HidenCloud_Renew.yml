@@ -3,7 +3,7 @@ name: HidenCloud 续期
 on:
   workflow_dispatch:
   schedule:
-    - cron: '13 3 4 5 *'   # 自动更新下次运行时间
+    - cron: '14 3 15 6 *'   # 自动更新下次运行时间
 
 permissions:
   contents: write
