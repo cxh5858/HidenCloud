@@ -38,6 +38,10 @@ USER_DATA_DIR = os.path.abspath(os.path.join(STATE_DIR, "selenium_profile"))
 
 MAX_RETRY = 3
 
+# 跨重试共享：记录第一次尝试时的续订前到期时间，
+# 用于识别"上一次其实已续期成功，只是后续超时"的情况
+RENEW_STATE = {"before_std": None, "before_raw": None}
+
 
 # ====================== 工具函数 ======================
 def get_bj_time():
@@ -75,6 +79,31 @@ def take_screenshot(driver, name):
     except Exception as e:
         print(f"[WARN] 截图失败: {e}")
     return filename
+
+
+def safe_get(driver, url):
+    """页面加载超时时不抛异常（页面通常已可用），其他异常照常抛出"""
+    try:
+        driver.get(url)
+    except Exception as e:
+        msg = str(e).lower()
+        if "timeout" in msg or "timed out" in msg:
+            print(f"[WARN] 页面加载超时，继续后续操作: {url}")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+        else:
+            raise
+
+
+def js_click(driver, element):
+    """滚动到视口中央后用 JS 点击，绕开遮挡层，也不会阻塞等待页面加载"""
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
+    )
+    time.sleep(1)
+    driver.execute_script("arguments[0].click();", element)
 
 
 def wait_for_turnstile_token(driver, timeout=90):
@@ -162,13 +191,9 @@ def create_driver():
         "headless2": True,
         "uc": True,
         "user_data_dir": USER_DATA_DIR,
-        "window_size": "1280,753",
+        "window_size": "1920,1080",
         "disable_csp": True,
-        "agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/147.0.0.0 Safari/537.36"
-        ),
+        # 不再写死 UA，避免与真实 Chrome 版本不一致
     }
     if PROXY_SERVER:
         kwargs["proxy"] = PROXY_SERVER
@@ -181,10 +206,6 @@ def create_driver():
 
 # ====================== Cookie 管理 ======================
 def get_latest_cookies(driver):
-    """
-    从当前浏览器提取最新的 remember me cookie 和 session cookie。
-    返回 (remember_value, session_value)，未找到则返回空字符串。
-    """
     remember_value = ""
     session_value  = ""
     try:
@@ -200,11 +221,6 @@ def get_latest_cookies(driver):
 
 
 def refresh_cookie_to_secret(driver):
-    """
-    续期完成后，将浏览器中最新的 remember me cookie
-    回写到 GitHub Secret（HIDENCLOUD），保持 cookie 长期有效。
-    需要环境变量 GH_TOKEN 和 GITHUB_REPOSITORY。
-    """
     repo = os.getenv("GITHUB_REPOSITORY", "")
     gh_token = os.getenv("GH_TOKEN", "")
     if not repo or not gh_token:
@@ -241,10 +257,6 @@ def refresh_cookie_to_secret(driver):
 
 # ====================== 登录方式 ======================
 def inject_cookies(driver, remember_value, session_value=""):
-    """
-    向浏览器注入 remember me cookie，以及可选的 session cookie。
-    注入前必须已在同域页面。
-    """
     if remember_value:
         driver.execute_script(
             f"document.cookie = '{COOKIE_NAME}={remember_value}; "
@@ -261,19 +273,14 @@ def inject_cookies(driver, remember_value, session_value=""):
 
 
 def inject_cookie_and_verify(driver):
-    """
-    注入 cookie 后访问 dashboard 验证是否生效。
-    成功返回 True，失败返回 False。
-    """
     print("[INFO] 🍪 尝试 Cookie 登录...")
 
-    # 先访问同域页面才能写 cookie
-    driver.get(f"{BASE_URL}/auth/login")
+    safe_get(driver, f"{BASE_URL}/auth/login")
     time.sleep(2)
 
     inject_cookies(driver, HIDEN_COOKIE)
 
-    driver.get(f"{BASE_URL}/dashboard")
+    safe_get(driver, f"{BASE_URL}/dashboard")
     time.sleep(3)
     take_screenshot(driver, "cookie-verify")
 
@@ -286,14 +293,10 @@ def inject_cookie_and_verify(driver):
 
 
 def do_login_with_credentials(driver):
-    """
-    账号密码 + Turnstile 登录，Turnstile 失败最多重试 3 次。
-    登录成功后同步注入最新 cookie，提升后续会话稳定性。
-    """
     TURNSTILE_RETRY = 3
     for attempt in range(1, TURNSTILE_RETRY + 1):
         print(f"[INFO] 🔒 账号密码登录尝试 {attempt}/{TURNSTILE_RETRY}")
-        driver.get(f"{BASE_URL}/auth/login")
+        safe_get(driver, f"{BASE_URL}/auth/login")
         time.sleep(3)
         take_screenshot(driver, f"pwd-login-{attempt}-page")
 
@@ -349,14 +352,7 @@ def do_login_with_credentials(driver):
 
 
 def ensure_logged_in(driver):
-    """
-    登录总入口（优先级）：
-      1. 已有有效 Session → 直接跳过
-      2. 配置了 Cookie   → 注入 Cookie 验证
-      3. Cookie 失效     → 回退账号密码
-      4. 未配置 Cookie   → 直接账号密码
-    """
-    driver.get(f"{BASE_URL}/dashboard")
+    safe_get(driver, f"{BASE_URL}/dashboard")
     time.sleep(3)
 
     if "/auth/login" not in driver.current_url:
@@ -386,7 +382,7 @@ def do_renew_once(driver):
 
     # ---------- 2. 提取服务器 ID ----------
     print("[INFO] 🔍 提取服务器 ID...")
-    driver.get(f"{BASE_URL}/dashboard")
+    safe_get(driver, f"{BASE_URL}/dashboard")
     time.sleep(3)
     take_screenshot(driver, "dashboard")
 
@@ -405,13 +401,32 @@ def do_renew_once(driver):
 
     manage_url = f"{BASE_URL}/service/{sid}/manage"
     print("[INFO] 🚀 访问管理页面")
-    driver.get(manage_url)
+    safe_get(driver, manage_url)
     time.sleep(3)
     take_screenshot(driver, "manage-page")
 
     # ---------- 3. 续订前到期时间 ----------
     due_date_before_raw, due_date_before_std = get_current_due_date(driver)
     print(f"[INFO] 续订前到期时间: {due_date_before_raw}")
+
+    # 重试时如果到期时间已比第一次尝试前更晚，说明上一次其实续期成功了
+    if RENEW_STATE["before_std"] is None:
+        RENEW_STATE["before_std"] = due_date_before_std
+        RENEW_STATE["before_raw"] = due_date_before_raw
+    elif (due_date_before_std and RENEW_STATE["before_std"]
+          and due_date_before_std > RENEW_STATE["before_std"]):
+        print("[INFO] ✅ 检测到上一次尝试已续期成功，不再重复操作")
+        print(f"到期时间(标准): {due_date_before_std}")
+        save_due_date(due_date_before_std)
+        refresh_cookie_to_secret(driver)
+        return (
+            "✅ 续订成功", RENEW_STATE["before_raw"], due_date_before_raw,
+            due_date_before_std, take_screenshot(driver, "final-due-date"),
+            sid, False, None, None
+        )
+
+    # 先保底写入当前到期时间，即使后面异常，workflow 也能更新 cron
+    save_due_date(due_date_before_std)
 
     # ---------- 4. 续期操作 ----------
     try:
@@ -441,7 +456,7 @@ def do_renew_once(driver):
             threshold = int(param_match.group(2))
             print(f"[INFO] 剩余: {days_left} 天，续期阈值: ≤{threshold} 天")
 
-        renew_btn.click()
+        js_click(driver, renew_btn)
         renew_executed = True
         time.sleep(3)
         take_screenshot(driver, "renew-clicked")
@@ -459,7 +474,8 @@ def do_renew_once(driver):
             print(f"[INFO] ⚠️ 续期限制: {alert_text}")
             take_screenshot(driver, "renewal-restricted")
             try:
-                driver.find_element("xpath", "//button[contains(text(),'OK')]").click()
+                ok_btn = driver.find_element("xpath", "//button[contains(text(),'OK')]")
+                js_click(driver, ok_btn)
                 time.sleep(1)
             except:
                 pass
@@ -468,9 +484,10 @@ def do_renew_once(driver):
             driver.wait_for_element_visible(modal_selector, timeout=10)
             take_screenshot(driver, "renew-modal")
 
-            driver.find_element(
+            submit_btn = driver.find_element(
                 by="css selector", value=f"{modal_selector} button[type='submit']"
-            ).click()
+            )
+            js_click(driver, submit_btn)
             time.sleep(3)
             take_screenshot(driver, "invoice-created")
 
@@ -493,19 +510,15 @@ def do_renew_once(driver):
         raise e
 
     # ---------- 5. 续订后到期时间 ----------
-    driver.get(manage_url)
+    safe_get(driver, manage_url)
     time.sleep(3)
     due_date_after_raw, due_date_after_std = get_current_due_date(driver)
     print(f"[INFO] 续订后到期时间: {due_date_after_raw}")
     final_screenshot = take_screenshot(driver, "final-due-date")
 
-    # 打印标准格式（workflow grep 兜底）
     print(f"到期时间(标准): {due_date_after_std or due_date_after_raw}")
-
-    # 写入文件供 workflow 读取
     save_due_date(due_date_after_std)
 
-    # ★ 自动刷新 cookie 到 GitHub Secret，保持长期有效
     refresh_cookie_to_secret(driver)
 
     # ---------- 6. 判断结果 ----------
