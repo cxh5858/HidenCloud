@@ -89,12 +89,32 @@ def safe_get(driver, url):
         msg = str(e).lower()
         if "timeout" in msg or "timed out" in msg:
             print(f"[WARN] 页面加载超时，继续后续操作: {url}")
-            try:
-                driver.execute_script("window.stop();")
-            except Exception:
-                pass
         else:
             raise
+
+
+def wait_page_styled(driver, timeout=20):
+    """等待页面和样式表加载完成，未完成则刷新一次"""
+    js = """
+        return document.readyState === 'complete' &&
+          [...document.querySelectorAll('link[rel=stylesheet]')].every(l => l.sheet);
+    """
+    for round_ in range(2):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                if driver.execute_script(js):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+        if round_ == 0:
+            print("[WARN] 样式未加载完成，刷新页面重试")
+            try:
+                driver.refresh()
+            except Exception:
+                pass
+    return False
 
 
 def js_click(driver, element):
@@ -403,6 +423,7 @@ def do_renew_once(driver):
     print("[INFO] 🚀 访问管理页面")
     safe_get(driver, manage_url)
     time.sleep(3)
+    wait_page_styled(driver)
     take_screenshot(driver, "manage-page")
 
     # ---------- 3. 续订前到期时间 ----------
@@ -512,6 +533,7 @@ def do_renew_once(driver):
     # ---------- 5. 续订后到期时间 ----------
     safe_get(driver, manage_url)
     time.sleep(3)
+    wait_page_styled(driver)
     due_date_after_raw, due_date_after_std = get_current_due_date(driver)
     print(f"[INFO] 续订后到期时间: {due_date_after_raw}")
     final_screenshot = take_screenshot(driver, "final-due-date")
