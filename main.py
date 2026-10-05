@@ -146,8 +146,73 @@ def get_turnstile_state(driver):
         return {"total": 0, "solved": 0}
 
 
+def cdp_cf_challenge_boxes(driver):
+    """
+    通过 CDP 在浏览器引擎层查找 Cloudflare 挑战 iframe。
+    新版 Turnstile 经常把 iframe 渲染在闭包 shadow DOM 里，普通的
+    querySelectorAll / driver.find_elements 从 JS·WebDriver 层面完全看不到，
+    必须用 CDP（在渲染引擎层工作，不受 shadow DOM 封装限制）才能找到。
+    返回 [(frame_id, box), ...]，box 为页面坐标 {'x','y','width','height'}。
+    """
+    boxes = []
+    try:
+        tree = driver.execute_cdp_cmd('Page.getFrameTree', {})
+    except Exception:
+        return boxes
+
+    frames = []
+
+    def walk(node):
+        f = node.get('frame', {})
+        if 'challenges.cloudflare.com' in (f.get('url') or ''):
+            frames.append(f)
+        for child in node.get('childFrames', []) or []:
+            walk(child)
+
+    walk(tree.get('frameTree', {}))
+
+    for f in frames:
+        try:
+            owner = driver.execute_cdp_cmd('DOM.getFrameOwner', {'frameId': f['id']})
+            backend_node_id = owner.get('backendNodeId')
+            if not backend_node_id:
+                continue
+            model = driver.execute_cdp_cmd('DOM.getBoxModel', {'backendNodeId': backend_node_id})
+            quad = (model.get('model') or {}).get('content')
+            if not quad or len(quad) < 8:
+                continue
+            xs = quad[0::2]
+            ys = quad[1::2]
+            box = {'x': min(xs), 'y': min(ys),
+                   'width': max(xs) - min(xs), 'height': max(ys) - min(ys)}
+            if box['width'] > 10 and box['height'] > 10:
+                boxes.append((f['id'], box))
+        except Exception:
+            continue
+    return boxes
+
+
+def cdp_click_at(driver, x, y):
+    """通过 CDP 在浏览器内核层注入鼠标事件，可以点到 shadow DOM 内嵌、普通点击够不到的元素"""
+    try:
+        driver.execute_cdp_cmd('Input.dispatchMouseEvent',
+                                {'type': 'mouseMoved', 'x': x, 'y': y, 'button': 'none'})
+        time.sleep(random.uniform(0.05, 0.15))
+        driver.execute_cdp_cmd('Input.dispatchMouseEvent',
+                                {'type': 'mousePressed', 'x': x, 'y': y,
+                                 'button': 'left', 'clickCount': 1})
+        time.sleep(random.uniform(0.05, 0.12))
+        driver.execute_cdp_cmd('Input.dispatchMouseEvent',
+                                {'type': 'mouseReleased', 'x': x, 'y': y,
+                                 'button': 'left', 'clickCount': 1})
+        return True
+    except Exception as e:
+        print(f"[WARN] CDP 底层点击失败: {e}")
+        return False
+
+
 def challenge_iframe_present(driver):
-    """是否存在可见的 Cloudflare 挑战 iframe"""
+    """是否存在 Cloudflare 挑战 iframe：先查普通 DOM，再用 CDP 查 shadow DOM 内嵌的"""
     try:
         for sel in ['iframe[src*="challenges.cloudflare.com"]', 'iframe[title*="Cloudflare"]']:
             for el in driver.find_elements(sel, by="css selector"):
@@ -158,7 +223,7 @@ def challenge_iframe_present(driver):
                     continue
     except Exception:
         pass
-    return False
+    return bool(cdp_cf_challenge_boxes(driver))
 
 
 def page_is_cf_interstitial(driver):
@@ -213,13 +278,24 @@ def solve_turnstile(driver, timeout=90, reload_after=6, require_positive=False):
             continue
 
         print(f"[INFO] 🛡️ 检测到 Turnstile 挑战，尝试点击（第 {click_count + 1} 次）...")
-        try:
-            driver.uc_gui_click_cf()
-        except Exception:
+        clicked = False
+        boxes = cdp_cf_challenge_boxes(driver)
+        if boxes:
+            _, box = boxes[0]
+            cx = box['x'] + min(30, box['width'] / 2) + random.uniform(-2, 2)
+            cy = box['y'] + box['height'] / 2 + random.uniform(-2, 2)
+            print(f"[INFO] 🖱️ CDP 底层点击挑战框 ({cx:.0f}, {cy:.0f})")
+            clicked = cdp_click_at(driver, cx, cy)
+        if not clicked:
             try:
-                driver.click(".cf-turnstile")
-            except Exception as e:
-                print(f"[WARN] 点击 Turnstile 失败: {e}")
+                driver.uc_gui_click_cf()
+                clicked = True
+            except Exception:
+                try:
+                    driver.click(".cf-turnstile")
+                    clicked = True
+                except Exception as e:
+                    print(f"[WARN] 点击 Turnstile 失败: {e}")
 
         click_count += 1
         time.sleep(random.uniform(4.0, 6.0))
@@ -617,53 +693,70 @@ def do_renew_once(driver):
             time.sleep(2)
             take_screenshot(driver, "invoice-submitted")
 
-            # 短轮询等待 Pay 按钮出现：不依赖具体 URL（原地更新或跳转页面都兼容），
-            # 轮询期间若冒出 Turnstile 顺手处理
-            find_pay_js = """
-                var els = Array.from(document.querySelectorAll('button, a'));
-                for (var i = 0; i < els.length; i++) {
-                    var t = (els[i].innerText || els[i].textContent || '').trim();
-                    if (/pay/i.test(t) && els[i].offsetParent !== null) {
-                        return {text: t, html: els[i].outerHTML.slice(0, 200)};
-                    }
-                }
-                return null;
-            """
-            pay_info = None
+            # 真实流程：点击 Create Invoice 后会整页跳转到独立的发票详情页
+            # （Invoice #xxxx，Pay / Share / Download 三个按钮）。
+            # 等待真正离开 manage 页、且出现 "Invoice #" 字样，期间若冒出 Turnstile 顺手处理。
+            invoice_ready = False
             wait_start = time.time()
             while time.time() - wait_start < 30:
                 if challenge_iframe_present(driver):
                     solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                pay_info = driver.execute_script(find_pay_js)
-                if pay_info:
+                page_text = driver.execute_script("return document.body.innerText;") or ""
+                if "/manage" not in driver.current_url and re.search(r'Invoice\s*#', page_text):
+                    invoice_ready = True
                     break
                 time.sleep(1)
 
             take_screenshot(driver, "invoice-created")
             print(f"[INFO] 🔎 当前页面: {driver.current_url}")
 
-            if not pay_info:
-                btn_texts = driver.execute_script(
-                    "return Array.from(document.querySelectorAll('button, a'))"
-                    ".map(e => (e.innerText||'').trim()).filter(Boolean);"
-                )
-                print(f"[WARN] 未找到 Pay 按钮。当前页面可点击元素文本: {btn_texts}")
-                take_screenshot(driver, "no-pay-btn")
+            if not invoice_ready:
+                take_screenshot(driver, "ERROR-no-invoice-page")
+                raise Exception("点击 Create Invoice 后未能跳转到发票详情页（可能弹窗内 Turnstile 未通过）")
+
+            # 安全校验：必须同时满足"发票属于当前服务器"+"金额为 0"，才允许点击 Pay，
+            # 避免误点到账号里其它未付款发票（例如历史遗留的余额充值发票）
+            invoice_text = driver.execute_script("return document.body.innerText;") or ""
+            if f"#{sid}" not in invoice_text:
+                take_screenshot(driver, "ERROR-wrong-invoice")
+                raise Exception(f"当前发票内容未包含服务器 #{sid}，为安全起见中止，不会点击 Pay")
+
+            amount_match = re.search(r'TOTAL\s*\n?\s*[€$]?\s*([\d.,]+)', invoice_text, re.IGNORECASE)
+            if amount_match:
+                try:
+                    amount_val = float(amount_match.group(1).replace(',', ''))
+                except ValueError:
+                    amount_val = None
+                if amount_val and amount_val > 0:
+                    take_screenshot(driver, "ERROR-nonzero-amount")
+                    raise Exception(f"发票金额不为 0（{amount_match.group(0).strip()}），为安全起见中止，不会自动支付")
             else:
-                print(f"[INFO] 🖱️ 找到支付按钮「{pay_info['text']}」→ {pay_info['html']}")
-                click_js = find_pay_js.replace(
-                    "return {text: t, html: els[i].outerHTML.slice(0, 200)};",
-                    "els[i].click(); return true;"
-                ).replace("return null;", "return false;")
-                pay_clicked = driver.execute_script(click_js)
-                print(f"[INFO] ✅ 已点击支付按钮，点击结果: {pay_clicked}")
-                time.sleep(3)
-                take_screenshot(driver, "pay-clicked")
-                solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
-                time.sleep(3)
-                print(f"[INFO] 🔎 支付后页面: {driver.current_url}")
-                take_screenshot(driver, "pay-done")
+                print("[WARN] 未能从页面解析出 TOTAL 金额，继续流程但请留意截图核实")
+
+            # 精确匹配发票页的 Pay 按钮：文本必须完全等于 "Pay"，不用模糊匹配，
+            # 避免抓到页面上其它含 "pay" 字样的无关元素
+            pay_btn = None
+            for by, value in [
+                ("xpath", "//button[normalize-space(text())='Pay']"),
+                ("xpath", "//a[normalize-space(text())='Pay']"),
+            ]:
+                try:
+                    btn = driver.find_element(by, value)
+                    if btn.is_displayed():
+                        pay_btn = btn
+                        break
+                except Exception:
+                    continue
+
+            if not pay_btn:
+                take_screenshot(driver, "no-pay-btn")
+                raise Exception("未在发票页面找到 Pay 按钮")
+
+            js_click(driver, pay_btn)
+            time.sleep(3)
+            solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+            take_screenshot(driver, "pay-done")
+            print(f"[INFO] 🔎 支付后页面: {driver.current_url}")
 
     except Exception as e:
         take_screenshot(driver, "ERROR-renew")
