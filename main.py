@@ -207,6 +207,7 @@ def solve_turnstile(driver, timeout=90, reload_after=6, require_positive=False):
                     print("[INFO] ✅ Turnstile 挑战框已消失，视为验证通过")
                     return True
             elif not require_positive and time.time() - start >= 5:
+                print("[INFO] ℹ️ 未检测到 Turnstile，跳过")
                 return True  # 页面本来就没有 Turnstile，无需处理
             time.sleep(1)
             continue
@@ -613,67 +614,73 @@ def do_renew_once(driver):
                 by="css selector", value=f"{modal_selector} button[type='submit']"
             )
             js_click(driver, submit_btn)
+            time.sleep(2)
+            take_screenshot(driver, "invoice-submitted")
 
-            # 等待跳转到发票/支付页面（最多 60 秒），期间若出现 Turnstile 顺带处理
-            invoice_url = None
-            wait_start = time.time()
-            while time.time() - wait_start < 60:
-                if "/payment/invoice/" in driver.current_url:
-                    invoice_url = driver.current_url
-                    break
-                if challenge_iframe_present(driver):
-                    solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
-                time.sleep(1)
-
-            if invoice_url:
-                print(f"[INFO] 🎉 已跳转到发票页面")
-            else:
-                print("[WARN] 未检测到跳转到发票页面，仍在当前页面继续查找 Pay 按钮")
-
-            take_screenshot(driver, "invoice-created")
-            solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-
-            # 按钮文本包含 Pay 即点击，不限定 button[type=submit]，兼容 <a> 标签
-            pay_js = """
+            # 短轮询等待 Pay 按钮出现：不依赖具体 URL（原地更新或跳转页面都兼容），
+            # 轮询期间若冒出 Turnstile 顺手处理
+            find_pay_js = """
                 var els = Array.from(document.querySelectorAll('button, a'));
                 for (var i = 0; i < els.length; i++) {
                     var t = (els[i].innerText || els[i].textContent || '').trim();
                     if (/pay/i.test(t) && els[i].offsetParent !== null) {
-                        els[i].click();
-                        return t;
+                        return {text: t, html: els[i].outerHTML.slice(0, 200)};
                     }
                 }
                 return null;
             """
-            pay_text = None
-            for _ in range(10):
-                pay_text = driver.execute_script(pay_js)
-                if pay_text:
+            pay_info = None
+            wait_start = time.time()
+            while time.time() - wait_start < 30:
+                if challenge_iframe_present(driver):
+                    solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                pay_info = driver.execute_script(find_pay_js)
+                if pay_info:
                     break
                 time.sleep(1)
 
-            if pay_text:
-                print(f"[INFO] ✅ 已点击支付按钮: {pay_text}")
-                time.sleep(5)
-                solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
-                take_screenshot(driver, "pay-done")
-            else:
+            take_screenshot(driver, "invoice-created")
+            print(f"[INFO] 🔎 当前页面: {driver.current_url}")
+
+            if not pay_info:
                 btn_texts = driver.execute_script(
                     "return Array.from(document.querySelectorAll('button, a'))"
                     ".map(e => (e.innerText||'').trim()).filter(Boolean);"
                 )
                 print(f"[WARN] 未找到 Pay 按钮。当前页面可点击元素文本: {btn_texts}")
                 take_screenshot(driver, "no-pay-btn")
+            else:
+                print(f"[INFO] 🖱️ 找到支付按钮「{pay_info['text']}」→ {pay_info['html']}")
+                click_js = find_pay_js.replace(
+                    "return {text: t, html: els[i].outerHTML.slice(0, 200)};",
+                    "els[i].click(); return true;"
+                ).replace("return null;", "return false;")
+                pay_clicked = driver.execute_script(click_js)
+                print(f"[INFO] ✅ 已点击支付按钮，点击结果: {pay_clicked}")
+                time.sleep(3)
+                take_screenshot(driver, "pay-clicked")
+                solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+                time.sleep(3)
+                print(f"[INFO] 🔎 支付后页面: {driver.current_url}")
+                take_screenshot(driver, "pay-done")
 
     except Exception as e:
         take_screenshot(driver, "ERROR-renew")
         raise e
 
-    # ---------- 5. 续订后到期时间 ----------
+    # ---------- 5. 续订后到期时间（支付后可能有延迟，多等几轮再确认）----------
     goto(driver, manage_url)
     due_date_after_raw, due_date_after_std = get_current_due_date(driver)
+    if not restricted:
+        for i in range(4):
+            if (due_date_after_std and due_date_before_std
+                    and due_date_after_std > due_date_before_std):
+                break
+            print(f"[INFO] ⏳ 到期时间尚未更新（第 {i+1}/4 次检查），5 秒后重新检查...")
+            time.sleep(5)
+            goto(driver, manage_url)
+            due_date_after_raw, due_date_after_std = get_current_due_date(driver)
     print(f"[INFO] 续订后到期时间: {due_date_after_raw}")
     final_screenshot = take_screenshot(driver, "final-due-date")
 
@@ -691,6 +698,14 @@ def do_renew_once(driver):
         result_status = "⚠️ 续期已执行，请确认"
     else:
         result_status = "❌ 续订失败"
+
+    # 真正的续期失败（非"受限"的正常情况）要抛异常：
+    # 1) 触发 main() 的重试，再给几次机会
+    # 2) 让这次 job 以失败状态结束，workflow 才会上传截图方便排查
+    if not restricted and result_status == "❌ 续订失败":
+        raise Exception(
+            f"续期后到期时间未变化（续订前 {due_date_before_raw} → 续订后 {due_date_after_raw}）"
+        )
 
     return (
         result_status, due_date_before_raw, due_date_after_raw,
