@@ -613,23 +613,59 @@ def do_renew_once(driver):
                 by="css selector", value=f"{modal_selector} button[type='submit']"
             )
             js_click(driver, submit_btn)
-            time.sleep(3)
-            take_screenshot(driver, "invoice-created")
 
-            time.sleep(5)
+            # 等待跳转到发票/支付页面（最多 60 秒），期间若出现 Turnstile 顺带处理
+            invoice_url = None
+            wait_start = time.time()
+            while time.time() - wait_start < 60:
+                if "/payment/invoice/" in driver.current_url:
+                    invoice_url = driver.current_url
+                    break
+                if challenge_iframe_present(driver):
+                    solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+                time.sleep(1)
+
+            if invoice_url:
+                print(f"[INFO] 🎉 已跳转到发票页面")
+            else:
+                print("[WARN] 未检测到跳转到发票页面，仍在当前页面继续查找 Pay 按钮")
+
+            take_screenshot(driver, "invoice-created")
             solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)
 
-            pay_clicked = driver.execute_script("""
-                var btn=document.querySelector('button[type="submit"]');
-                if(btn && btn.innerText.includes('Pay')){btn.click();return true;}
-                return false;
-            """)
-            time.sleep(5)
-            take_screenshot(driver, "pay-done" if pay_clicked else "no-pay-btn")
-            if not pay_clicked:
-                print("[WARN] 未找到 Pay 按钮，可能免费服务自动完成")
+            # 按钮文本包含 Pay 即点击，不限定 button[type=submit]，兼容 <a> 标签
+            pay_js = """
+                var els = Array.from(document.querySelectorAll('button, a'));
+                for (var i = 0; i < els.length; i++) {
+                    var t = (els[i].innerText || els[i].textContent || '').trim();
+                    if (/pay/i.test(t) && els[i].offsetParent !== null) {
+                        els[i].click();
+                        return t;
+                    }
+                }
+                return null;
+            """
+            pay_text = None
+            for _ in range(10):
+                pay_text = driver.execute_script(pay_js)
+                if pay_text:
+                    break
+                time.sleep(1)
+
+            if pay_text:
+                print(f"[INFO] ✅ 已点击支付按钮: {pay_text}")
+                time.sleep(5)
+                solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+                take_screenshot(driver, "pay-done")
+            else:
+                btn_texts = driver.execute_script(
+                    "return Array.from(document.querySelectorAll('button, a'))"
+                    ".map(e => (e.innerText||'').trim()).filter(Boolean);"
+                )
+                print(f"[WARN] 未找到 Pay 按钮。当前页面可点击元素文本: {btn_texts}")
+                take_screenshot(driver, "no-pay-btn")
 
     except Exception as e:
         take_screenshot(driver, "ERROR-renew")
