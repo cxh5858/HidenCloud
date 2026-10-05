@@ -4,6 +4,7 @@
 import os
 import re
 import time
+import random
 import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
@@ -126,18 +127,124 @@ def js_click(driver, element):
     driver.execute_script("arguments[0].click();", element)
 
 
-def wait_for_turnstile_token(driver, timeout=90):
-    print("[INFO] ⏳ 等待 Turnstile 验证通过...")
-    start = time.time()
-    while time.time() - start < timeout:
-        token = driver.execute_script(
-            'return document.querySelector("[name=cf-turnstile-response]")?.value'
-        )
-        if token and len(token) > 20:
-            print("[INFO] ✅ Turnstile token 已生成")
-            return True
-        time.sleep(1)
+def get_turnstile_state(driver):
+    """统计页面上 Turnstile 隐藏 token 是否已生成"""
+    try:
+        js = """
+            var total = 0, solved = 0;
+            document.querySelectorAll(
+                'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+            ).forEach(function (n) {
+                total += 1;
+                if (n.value && n.value.length > 20) solved += 1;
+            });
+            return {total: total, solved: solved};
+        """
+        st = driver.execute_script(js) or {}
+        return {"total": int(st.get("total", 0)), "solved": int(st.get("solved", 0))}
+    except Exception:
+        return {"total": 0, "solved": 0}
+
+
+def challenge_iframe_present(driver):
+    """是否存在可见的 Cloudflare 挑战 iframe"""
+    try:
+        for sel in ['iframe[src*="challenges.cloudflare.com"]', 'iframe[title*="Cloudflare"]']:
+            for el in driver.find_elements(sel, by="css selector"):
+                try:
+                    if el.is_displayed():
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return False
+
+
+def page_is_cf_interstitial(driver):
+    """页面是否停留在 Cloudflare 拦截/验证过渡页，而非真实业务页面"""
+    try:
+        title = (driver.get_title() or "").lower()
+    except Exception:
+        return False
+    blocked = ("just a moment", "attention required", "checking your browser",
+               "请稍候", "security verification", "请验证")
+    return any(k in title for k in blocked)
+
+
+def solve_turnstile(driver, timeout=90, reload_after=6, require_positive=False):
+    """
+    处理 Cloudflare Turnstile 验证，多种"通过信号"任一满足即视为通过：
+      1) 隐藏 input 的 token 已生成
+      2) 挑战 iframe 曾出现后消失并保持 8 秒（避免抖动误判）
+      3) 从未出现挑战框，且不强制要求通过（require_positive=False）
+    点击多次仍未通过时，刷新页面换一个新挑战重试（最多 2 次）。
+    """
+    start = time.time()
+    baseline = get_turnstile_state(driver)
+    had_iframe = False
+    iframe_gone_since = None
+    click_count = 0
+    reload_done = 0
+
+    while time.time() - start < timeout:
+        st = get_turnstile_state(driver)
+        if st["total"] > 0 and st["solved"] >= st["total"] and (
+            st["total"] > baseline["total"] or st["solved"] > baseline["solved"]
+        ):
+            print(f"[INFO] ✅ Turnstile 已验证通过（token {st['solved']}/{st['total']}）")
+            return True
+
+        has_iframe = challenge_iframe_present(driver)
+        if has_iframe:
+            had_iframe = True
+            iframe_gone_since = None
+        else:
+            if had_iframe:
+                if iframe_gone_since is None:
+                    iframe_gone_since = time.time()
+                elif time.time() - iframe_gone_since >= 8:
+                    print("[INFO] ✅ Turnstile 挑战框已消失，视为验证通过")
+                    return True
+            elif not require_positive and time.time() - start >= 5:
+                return True  # 页面本来就没有 Turnstile，无需处理
+            time.sleep(1)
+            continue
+
+        print(f"[INFO] 🛡️ 检测到 Turnstile 挑战，尝试点击（第 {click_count + 1} 次）...")
+        try:
+            driver.uc_gui_click_cf()
+        except Exception:
+            try:
+                driver.click(".cf-turnstile")
+            except Exception as e:
+                print(f"[WARN] 点击 Turnstile 失败: {e}")
+
+        click_count += 1
+        time.sleep(random.uniform(4.0, 6.0))
+
+        if reload_after and click_count >= reload_after and reload_done < 2:
+            reload_done += 1
+            print(f"[WARN] 累计点击 {click_count} 次未通过，刷新页面重试（{reload_done}/2）")
+            click_count = 0
+            had_iframe = False
+            iframe_gone_since = None
+            try:
+                driver.refresh()
+                time.sleep(3)
+            except Exception:
+                pass
+
+    print(f"[WARN] ❌ Turnstile 处理超时（{timeout}s）")
+    return False
+
+
+def goto(driver, url, timeout=90, reload_after=6):
+    """统一的页面跳转：加载 → 处理可能出现的 Turnstile → 等样式加载完"""
+    safe_get(driver, url)
+    time.sleep(2)
+    solve_turnstile(driver, timeout=timeout, reload_after=reload_after, require_positive=False)
+    wait_page_styled(driver)
 
 
 def wait_for_url_contains(driver, keyword, timeout=45):
@@ -300,8 +407,7 @@ def inject_cookie_and_verify(driver):
 
     inject_cookies(driver, HIDEN_COOKIE)
 
-    safe_get(driver, f"{BASE_URL}/dashboard")
-    time.sleep(3)
+    goto(driver, f"{BASE_URL}/dashboard")
     take_screenshot(driver, "cookie-verify")
 
     if "/auth/login" not in driver.current_url and "/dashboard" in driver.current_url:
@@ -327,17 +433,10 @@ def do_login_with_credentials(driver):
         time.sleep(5)
 
         if driver.is_element_present(".cf-turnstile"):
-            print("[INFO] 🖱️ 尝试点击 Turnstile...")
-            try:
-                driver.uc_gui_click_cf(".cf-turnstile")
-            except:
-                try:
-                    driver.click(".cf-turnstile")
-                except:
-                    pass
+            print("[INFO] 🛡️ 处理登录页 Turnstile...")
             take_screenshot(driver, f"pwd-login-{attempt}-turnstile")
 
-            if not wait_for_turnstile_token(driver, timeout=90):
+            if not solve_turnstile(driver, timeout=90, reload_after=4, require_positive=True):
                 take_screenshot(driver, f"pwd-login-{attempt}-turnstile-timeout")
                 if attempt < TURNSTILE_RETRY:
                     wait_sec = attempt * 15
@@ -350,6 +449,9 @@ def do_login_with_credentials(driver):
 
         driver.click("button[type='submit']")
         take_screenshot(driver, f"pwd-login-{attempt}-submitted")
+
+        # 提交后若再次出现 Turnstile（二次校验），顺带处理一次，不强制要求
+        solve_turnstile(driver, timeout=30, reload_after=4, require_positive=False)
 
         if wait_for_url_contains(driver, "/dashboard", timeout=45):
             print("[INFO] ✅ 账号密码登录成功")
@@ -372,8 +474,7 @@ def do_login_with_credentials(driver):
 
 
 def ensure_logged_in(driver):
-    safe_get(driver, f"{BASE_URL}/dashboard")
-    time.sleep(3)
+    goto(driver, f"{BASE_URL}/dashboard")
 
     if "/auth/login" not in driver.current_url:
         print("[INFO] ✅ 已有有效 Session，无需登录")
@@ -402,8 +503,7 @@ def do_renew_once(driver):
 
     # ---------- 2. 提取服务器 ID ----------
     print("[INFO] 🔍 提取服务器 ID...")
-    safe_get(driver, f"{BASE_URL}/dashboard")
-    time.sleep(3)
+    goto(driver, f"{BASE_URL}/dashboard")
     take_screenshot(driver, "dashboard")
 
     try:
@@ -421,9 +521,7 @@ def do_renew_once(driver):
 
     manage_url = f"{BASE_URL}/service/{sid}/manage"
     print("[INFO] 🚀 访问管理页面")
-    safe_get(driver, manage_url)
-    time.sleep(3)
-    wait_page_styled(driver)
+    goto(driver, manage_url)
     take_screenshot(driver, "manage-page")
 
     # ---------- 3. 续订前到期时间 ----------
@@ -482,6 +580,9 @@ def do_renew_once(driver):
         time.sleep(3)
         take_screenshot(driver, "renew-clicked")
 
+        # 点击 Renew 后可能弹出 Turnstile，先处理（不强制，没有就直接跳过）
+        solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+
         restriction_h3 = driver.execute_script(
             "var el=document.querySelector('.fixed.inset-0 h3');"
             "return el?el.textContent.trim():'';"
@@ -505,6 +606,9 @@ def do_renew_once(driver):
             driver.wait_for_element_visible(modal_selector, timeout=10)
             take_screenshot(driver, "renew-modal")
 
+            # 弹窗内可能内嵌 Turnstile，提交前先处理
+            solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
+
             submit_btn = driver.find_element(
                 by="css selector", value=f"{modal_selector} button[type='submit']"
             )
@@ -513,6 +617,7 @@ def do_renew_once(driver):
             take_screenshot(driver, "invoice-created")
 
             time.sleep(5)
+            solve_turnstile(driver, timeout=30, reload_after=3, require_positive=False)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)
 
@@ -531,9 +636,7 @@ def do_renew_once(driver):
         raise e
 
     # ---------- 5. 续订后到期时间 ----------
-    safe_get(driver, manage_url)
-    time.sleep(3)
-    wait_page_styled(driver)
+    goto(driver, manage_url)
     due_date_after_raw, due_date_after_std = get_current_due_date(driver)
     print(f"[INFO] 续订后到期时间: {due_date_after_raw}")
     final_screenshot = take_screenshot(driver, "final-due-date")
